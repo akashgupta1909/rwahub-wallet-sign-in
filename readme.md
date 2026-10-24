@@ -1,6 +1,6 @@
 # RWAHub: Web3 Marketplace for Real-World Asset Tokenization
 
-> **Wallet Sign In task:** demo video → [docs/wallet-sign-in-demo.mp4](docs/wallet-sign-in-demo.mp4).
+> **Wallet Sign In task:** demo video → [Google Drive](https://drive.google.com/file/d/1FPVPeNfpeh25DhJyO5xJqcx5xveTYmCc/view?usp=sharing).
 > Code changes are in the latest commit (`src/lib/wallet.ts`, `src/hooks/useWalletStatus.ts`,
 > `src/store/authStore.ts`, `src/components/AuthModal.tsx`, `src/components/layout/Header.tsx`).
 
