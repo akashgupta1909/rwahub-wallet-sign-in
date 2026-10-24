@@ -1,192 +1,94 @@
 import { create } from 'zustand';
 import { persist } from 'zustand/middleware';
 import { ethers } from 'ethers';
-import deployed from '@/config/contracts.json';
+import { toast } from 'sonner';
+import {
+  type Eip1193Provider,
+  type WalletErrorInfo,
+  WalletError,
+  getInjectedProvider,
+  isSupportedChain,
+  readBalance,
+  readChainId,
+  requestWallet,
+  shortenAddress,
+  switchToTargetNetwork,
+  toWalletError,
+} from '@/lib/wallet';
 
-const PHAROS_DEVNET_CHAIN_ID = 50002;
-const PHAROS_DEVNET_HEX_CHAIN_ID = ethers.utils.hexValue(PHAROS_DEVNET_CHAIN_ID);
-const PHAROS_NETWORK_CONFIG = {
-  chainId: PHAROS_DEVNET_HEX_CHAIN_ID,
-  chainName: 'Pharos Devnet',
-  rpcUrls: ['https://devnet.dplabs-internal.com'],
-  nativeCurrency: { name: 'Pharos', symbol: 'PHAROS', decimals: 18 },
-  blockExplorerUrls: ['https://pharosscan.xyz'],
-};
+// Wallet event wiring lives outside the store: provider handlers are not serializable
+// and must not be persisted. They are re-attached by restoreWalletSession() after reload.
+let activeProvider: Eip1193Provider | null = null;
 
-const HARDHAT_CHAIN_ID = 31337;
-const HARDHAT_HEX_CHAIN_ID = ethers.utils.hexValue(HARDHAT_CHAIN_ID);
-const HARDHAT_NETWORK_CONFIG = {
-  chainId: HARDHAT_HEX_CHAIN_ID,
-  chainName: 'Hardhat Local',
-  rpcUrls: ['http://127.0.0.1:8545'],
-  nativeCurrency: { name: 'ETH', symbol: 'ETH', decimals: 18 },
-};
-
-const getTargetNetwork = () => {
-  if (deployed.marketplace && Number(deployed.chainId) === HARDHAT_CHAIN_ID) {
-    return {
-      chainId: HARDHAT_CHAIN_ID,
-      hexChainId: HARDHAT_HEX_CHAIN_ID,
-      config: HARDHAT_NETWORK_CONFIG,
-    };
-  }
-  return {
-    chainId: PHAROS_DEVNET_CHAIN_ID,
-    hexChainId: PHAROS_DEVNET_HEX_CHAIN_ID,
-    config: PHAROS_NETWORK_CONFIG,
-  };
-};
-
-let accountsChangedHandler: ((accounts: string[]) => Promise<void>) | null = null;
-let chainChangedHandler: ((chainId: string) => Promise<void>) | null = null;
-let activeEthereumProvider: any = null;
-
-/** Prefer MetaMask / a single provider when multiple wallets inject (reduces extension messaging errors). */
-const getEip1193Provider = () => {
-  if (typeof window === 'undefined') {
-    return null;
-  }
-  const win = window as any;
-  const e = win.ethereum;
-  if (!e) {
-    return null;
-  }
-  if (Array.isArray(e.providers) && e.providers.length > 0) {
-    const withRequest = (p: any) => typeof p?.request === 'function';
-    return (
-      e.providers.find((p: any) => p.isMetaMask && withRequest(p)) ||
-      e.providers.find((p: any) => p.isOkxWallet && withRequest(p)) ||
-      e.providers.find((p: any) => p.isRabby && withRequest(p)) ||
-      e.providers.find(withRequest) ||
-      e.providers[0]
-    );
-  }
-  return e;
-};
-
-const getEthereum = () => getEip1193Provider();
-
-const getNormalizedError = (error: unknown): { code?: number; message: string } => {
-  if (typeof error === 'object' && error !== null) {
-    const maybeError = error as {
-      code?: number | string;
-      message?: string;
-      error?: { code?: number | string; message?: string };
-      data?: { originalError?: { code?: number | string } };
-    };
-    const rawCode =
-      maybeError.code ??
-      maybeError.error?.code ??
-      maybeError.data?.originalError?.code;
-    const code = rawCode === undefined ? undefined : Number(rawCode);
-    return {
-      code: Number.isFinite(code) ? code : undefined,
-      message: maybeError.message ?? maybeError.error?.message ?? 'Unknown wallet error',
-    };
-  }
-
-  if (error instanceof Error) {
-    return { message: error.message };
-  }
-
-  return { message: 'Unknown wallet error' };
-};
-
-const createWeb3Provider = (ethereum: any) =>
-  new ethers.providers.Web3Provider(ethereum, 'any');
-
-const safeOn = (ethereum: any, event: string, handler: (...args: any[]) => void) => {
-  if (typeof ethereum?.on === 'function') {
-    ethereum.on(event, handler);
-  } else if (typeof ethereum?.addListener === 'function') {
-    ethereum.addListener(event, handler);
-  }
-};
-
-const safeOff = (ethereum: any, event: string, handler: ((...args: any[]) => void) | null) => {
-  if (!ethereum || !handler) {
+const onAccountsChanged = async (accounts: string[]) => {
+  const { user } = useAuthStore.getState();
+  if (!accounts?.length) {
+    // Wallet locked, or the site was disconnected from inside MetaMask.
+    signOutLocally();
+    toast.info('Your wallet was disconnected.');
     return;
   }
-  if (typeof ethereum.removeListener === 'function') {
-    ethereum.removeListener(event, handler);
+  const address = ethers.utils.getAddress(accounts[0]);
+  if (address === user?.wallet?.address || !activeProvider) {
     return;
   }
-  if (typeof ethereum.off === 'function') {
-    ethereum.off(event, handler);
-  }
+  // A different account is a different identity: don't carry the old profile over.
+  const chainId = await readChainId(activeProvider).catch(() => user?.wallet?.chainId);
+  const balance = await readBalance(activeProvider, address);
+  useAuthStore.setState({ user: createWalletUser(address, chainId, balance), walletError: null });
+  toast.info(`Switched to account ${shortenAddress(address)}.`);
 };
 
-const requestWallet = async <T>(
-  ethereum: any,
-  method: string,
-  params?: any[],
-  timeoutMs = 120000
-): Promise<T> => {
-  if (!ethereum || typeof ethereum.request !== 'function') {
-    throw new Error('Wallet provider is not available. Please refresh the page and try again.');
+const onChainChanged = async (chainIdHex: string) => {
+  const chainId = Number.parseInt(chainIdHex, 16);
+  const { user, walletError } = useAuthStore.getState();
+  if (!user?.wallet || !activeProvider) {
+    return;
   }
+  const balance = await readBalance(activeProvider, user.wallet.address);
+  useAuthStore.setState((state) => ({
+    user: state.user?.wallet
+      ? { ...state.user, wallet: { ...state.user.wallet, chainId, balance } }
+      : state.user,
+    // A stale "switch failed" message is wrong once the user fixes it in MetaMask.
+    walletError: isSupportedChain(chainId) ? null : walletError,
+  }));
+};
 
-  const requestPromise = ethereum.request(
-    params ? { method, params } : { method }
-  ) as Promise<T>;
+const attachProvider = (provider: Eip1193Provider) => {
+  detachProvider();
+  activeProvider = provider;
+  provider.on?.('accountsChanged', onAccountsChanged);
+  provider.on?.('chainChanged', onChainChanged);
+};
 
-  if (method === 'eth_requestAccounts') {
-    return requestPromise;
-  }
+const detachProvider = () => {
+  activeProvider?.removeListener?.('accountsChanged', onAccountsChanged);
+  activeProvider?.removeListener?.('chainChanged', onChainChanged);
+  activeProvider = null;
+};
 
-  let timerId = 0;
-  const timeoutPromise = new Promise<never>((_, reject) => {
-    timerId = window.setTimeout(() => {
-      reject(new Error(`Wallet request timed out: ${method}`));
-    }, timeoutMs);
+const signOutLocally = () => {
+  detachProvider();
+  useAuthStore.setState({
+    isAuthenticated: false,
+    user: null,
+    loading: false,
+    error: null,
+    walletRequest: 'none',
+    walletError: null,
   });
-
-  try {
-    return await Promise.race([requestPromise, timeoutPromise]);
-  } finally {
-    window.clearTimeout(timerId);
-  }
 };
 
-const ensurePharosNetwork = async (ethereum: any): Promise<number> => {
-  const target = getTargetNetwork();
-  const provider = createWeb3Provider(ethereum);
-  let chainId = 0;
-  try {
-    const network = await provider.getNetwork();
-    chainId = Number(network.chainId);
-  } catch {
-    chainId = 0;
-  }
+const createWalletUser = (address: string, chainId?: number, balance = '0'): User => ({
+  id: address.toLowerCase(),
+  wallet: { address, isConnected: true, provider: 'metamask', chainId, balance },
+  roles: { isBuyer: true, isSeller: false },
+  stats: { totalPurchases: 0, totalSales: 0 },
+});
 
-  if (chainId === target.chainId) {
-    return chainId;
-  }
-
-  try {
-    await requestWallet<void>(
-      ethereum,
-      'wallet_switchEthereumChain',
-      [{ chainId: target.hexChainId }],
-      30000
-    );
-    return target.chainId;
-  } catch (switchError) {
-    const { code } = getNormalizedError(switchError);
-    if (code !== 4902) {
-      throw switchError;
-    }
-  }
-
-  await requestWallet<void>(
-    ethereum,
-    'wallet_addEthereumChain',
-    [target.config],
-    30000
-  );
-  return target.chainId;
-};
-
+/** What the wallet is currently being asked to do; drives the Sign In modal's progress copy. */
+export type WalletRequest = 'none' | 'connecting' | 'switching';
 interface KYCData {
   status: 'pending' | 'verified' | 'rejected';
   idVerified: boolean;
@@ -243,6 +145,8 @@ interface AuthState {
   loading: boolean;
   error: string | null;
   authModalOpen: boolean;
+  walletRequest: WalletRequest;
+  walletError: WalletErrorInfo | null;
   openAuthModal: () => void;
   closeAuthModal: () => void;
   login: (email: string, password: string) => Promise<void>;
@@ -251,8 +155,10 @@ interface AuthState {
   resetPassword: (email: string) => Promise<void>;
   updateProfile: (updates: Partial<User>) => Promise<void>;
   connectWallet: () => Promise<boolean>;
-  switchToPharos: () => Promise<boolean>;
+  switchNetwork: () => Promise<boolean>;
   disconnectWallet: () => Promise<void>;
+  restoreWalletSession: () => Promise<void>;
+  clearWalletError: () => void;
   submitKYC: (documents: KYCData['documents']) => Promise<void>;
   updateKYCStatus: (status: KYCData['status']) => Promise<void>;
   toggleRole: (role: 'buyer' | 'seller', enabled: boolean) => Promise<void>;
@@ -285,7 +191,9 @@ export const useAuthStore = create<AuthState>()(
       loading: false,
       error: null,
       authModalOpen: false,
-      openAuthModal: () => set({ authModalOpen: true, error: null }),
+      walletRequest: 'none',
+      walletError: null,
+      openAuthModal: () => set({ authModalOpen: true, error: null, walletError: null }),
       closeAuthModal: () => set({ authModalOpen: false }),
 
       login: async (email: string, password: string) => {
@@ -343,33 +251,7 @@ export const useAuthStore = create<AuthState>()(
       },
 
       logout: async () => {
-        try {
-          console.log('Starting logout process...');
-          set({ loading: true, error: null });
-          const currentUser = get().user;
-          if (currentUser?.wallet?.isConnected) {
-            console.log('Wallet connected, disconnecting...');
-            await get().disconnectWallet();
-          } else {
-            console.log('No wallet connected, clearing state...');
-            set({
-              isAuthenticated: false,
-              user: null,
-              error: null,
-              loading: false,
-            });
-            localStorage.removeItem('auth-storage');
-            sessionStorage.clear();
-            console.log('State cleared, redirecting to /');
-            window.location.href = '/';
-          }
-        } catch (error) {
-          console.error('Logout error:', error);
-          set({
-            error: (error as Error).message,
-            loading: false,
-          });
-        }
+        await get().disconnectWallet();
       },
 
       resetPassword: async (email: string) => {
@@ -402,229 +284,143 @@ export const useAuthStore = create<AuthState>()(
       },
 
       connectWallet: async () => {
-        if (get().loading) {
+        if (get().walletRequest !== 'none') {
           return false;
         }
+        const provider = getInjectedProvider();
+        if (!provider) {
+          set({
+            walletError: {
+              code: 'NO_WALLET',
+              message: 'No wallet found in this browser. Install MetaMask to sign in.',
+            },
+          });
+          return false;
+        }
+
+        set({ walletRequest: 'connecting', walletError: null, error: null });
         try {
-          set({ loading: true, error: null });
-
-          const ethereum = getEthereum();
-          if (!ethereum) {
-            throw new Error('Please install MetaMask or another Web3 wallet.');
-          }
-          if (typeof ethereum.request !== 'function') {
-            throw new Error('Wallet provider is not available. Please refresh the page and try again.');
-          }
-
-          activeEthereumProvider = ethereum;
-
-          let accounts: string[] = [];
-          try {
-            accounts = await requestWallet<string[]>(ethereum, 'eth_requestAccounts');
-          } catch (requestError) {
-            const { code, message } = getNormalizedError(requestError);
-            if (code === -32002 || message.toLowerCase().includes('already processing')) {
-              accounts = await requestWallet<string[]>(ethereum, 'eth_accounts');
-            } else {
-              throw requestError;
-            }
-          }
-
+          // No timeout: this waits on the user in the MetaMask popup.
+          const accounts = await requestWallet<string[]>(provider, 'eth_requestAccounts');
           if (!accounts?.length) {
-            throw new Error('No account returned from the wallet. Open MetaMask and try again.');
+            throw new WalletError(
+              'NO_ACCOUNTS',
+              'Your wallet did not share an account. Unlock MetaMask, pick an account, and try again.'
+            );
           }
           const address = ethers.utils.getAddress(accounts[0]);
+          let chainId = await readChainId(provider);
 
-          let chainId = 0;
-          try {
-            chainId = await ensurePharosNetwork(ethereum);
-          } catch {
+          // Signing in only needs the account. If the network is wrong we still sign in,
+          // offer the switch once, and leave the user in a visible "wrong network" state if
+          // they decline — rather than failing the whole sign in.
+          let walletError: WalletErrorInfo | null = null;
+          if (!isSupportedChain(chainId)) {
+            set({ walletRequest: 'switching' });
             try {
-              const network = await createWeb3Provider(ethereum).getNetwork();
-              chainId = Number(network.chainId);
-            } catch {
-              chainId = 0;
+              chainId = await switchToTargetNetwork(provider);
+            } catch (switchError) {
+              walletError = toWalletError(switchError, 'switch');
             }
           }
 
-          let formattedBalance = '0';
-          try {
-            const balance = await createWeb3Provider(ethereum).getBalance(address);
-            formattedBalance = ethers.utils.formatEther(balance);
-          } catch {
-            formattedBalance = '0';
-          }
-
+          const balance = await readBalance(provider, address);
           const currentUser = get().user;
-          const wallet = {
-            address,
-            isConnected: true,
-            provider: 'metamask',
-            chainId,
-            balance: formattedBalance,
-          };
-          const nextUser: User = currentUser
-            ? { ...currentUser, wallet }
-            : {
-                id: crypto.randomUUID(),
-                wallet,
-                roles: { isBuyer: true, isSeller: false },
-                stats: { totalPurchases: 0, totalSales: 0 },
-              };
-
-          safeOff(activeEthereumProvider, 'accountsChanged', accountsChangedHandler);
-          safeOff(activeEthereumProvider, 'chainChanged', chainChangedHandler);
-
-          accountsChangedHandler = async (updatedAccounts: string[]) => {
-            if (!updatedAccounts?.length) {
-              await get().disconnectWallet();
-              return;
-            }
-
-            const nextAddress = ethers.utils.getAddress(updatedAccounts[0]);
-            const e = getEthereum() || activeEthereumProvider;
-            let nextBalance = '0';
-            let nextChainId = get().user?.wallet?.chainId || 0;
-            try {
-              const nextProvider = createWeb3Provider(e);
-              nextBalance = ethers.utils.formatEther(await nextProvider.getBalance(nextAddress));
-              nextChainId = Number((await nextProvider.getNetwork()).chainId);
-            } catch {
-              // Keep the connected account even if RPC reads fail.
-            }
-
-            set((state) => ({
-              user: state.user
-                ? {
-                    ...state.user,
-                    wallet: {
-                      address: nextAddress,
-                      isConnected: true,
-                      provider: 'metamask',
-                      chainId: nextChainId,
-                      balance: nextBalance,
-                    },
-                  }
-                : state.user,
-            }));
-          };
-
-          chainChangedHandler = async (chainIdHex: string) => {
-            const parsedChainId = Number.parseInt(chainIdHex, 16);
-            const connectedAddress = get().user?.wallet?.address;
-            let nextBalance = get().user?.wallet?.balance || '0';
-            if (connectedAddress) {
-              try {
-                const e = getEthereum() || activeEthereumProvider;
-                nextBalance = ethers.utils.formatEther(
-                  await createWeb3Provider(e).getBalance(connectedAddress)
-                );
-              } catch {
-                // Ignore RPC read failures after a network change.
-              }
-            }
-
-            set((state) => ({
-              error:
-                parsedChainId === getTargetNetwork().chainId
-                  ? null
-                  : 'Wallet connected. Switch network to send transactions.',
-              user: state.user
-                ? {
-                    ...state.user,
-                    wallet: {
-                      ...state.user.wallet!,
-                      chainId: parsedChainId,
-                      balance: nextBalance,
-                    },
-                  }
-                : state.user,
-            }));
-          };
-
-          safeOn(ethereum, 'accountsChanged', accountsChangedHandler);
-          safeOn(ethereum, 'chainChanged', chainChangedHandler);
-
+          const wallet = { address, isConnected: true, provider: 'metamask', chainId, balance };
+          attachProvider(provider);
           set({
             isAuthenticated: true,
-            user: nextUser,
-            loading: false,
-            error:
-              chainId === getTargetNetwork().chainId
-                ? null
-                : 'Wallet connected. Switch network to send transactions.',
+            user:
+              currentUser?.wallet?.address === address
+                ? { ...currentUser, wallet }
+                : createWalletUser(address, chainId, balance),
+            walletRequest: 'none',
+            walletError,
           });
           return true;
         } catch (error) {
-          const normalized = getNormalizedError(error);
-          const message = normalized.message.toLowerCase();
-          let errorMessage = 'Failed to connect wallet. Please try again.';
-          if (normalized.code === 4001 || message.includes('rejected') || message.includes('denied')) {
-            errorMessage = 'Wallet connection was rejected.';
-          } else if (normalized.code === -32002 || message.includes('already processing')) {
-            errorMessage = 'MetaMask is already open. Confirm the pending request, then retry.';
-          } else if (message.includes('install metamask') || message.includes('wallet provider is not available')) {
-            errorMessage = 'Please install MetaMask or unlock it and refresh this page.';
-          } else if (message.includes('receiving end does not exist')) {
-            errorMessage = 'Wallet extension is not responding. Reopen MetaMask and refresh this page.';
-          } else if (message.includes('timed out')) {
-            errorMessage = 'Wallet request timed out. Open your wallet popup and try again.';
-          }
-          set({ error: errorMessage, loading: false });
+          set({ walletRequest: 'none', walletError: toWalletError(error, 'connect') });
           return false;
         }
       },
 
-      switchToPharos: async () => {
+      switchNetwork: async () => {
+        const provider = activeProvider ?? getInjectedProvider();
+        if (!provider) {
+          set({
+            walletError: {
+              code: 'NO_WALLET',
+              message: 'No wallet found in this browser. Install MetaMask to continue.',
+            },
+          });
+          return false;
+        }
+        set({ walletRequest: 'switching', walletError: null });
         try {
-          const ethereum = getEthereum();
-          if (!ethereum) {
-            set({ error: 'Please install MetaMask or another Web3 wallet.' });
-            return false;
-          }
-          const chainId = await ensurePharosNetwork(ethereum);
+          const chainId = await switchToTargetNetwork(provider);
           set((state) => ({
-            error: null,
+            walletRequest: 'none',
             user: state.user?.wallet
-              ? {
-                  ...state.user,
-                  wallet: { ...state.user.wallet, chainId },
-                }
+              ? { ...state.user, wallet: { ...state.user.wallet, chainId } }
               : state.user,
           }));
-          return chainId === getTargetNetwork().chainId;
-        } catch {
-          set({ error: 'Could not switch to Pharos Devnet. Approve the request in MetaMask.' });
+          return isSupportedChain(chainId);
+        } catch (error) {
+          set({ walletRequest: 'none', walletError: toWalletError(error, 'switch') });
           return false;
         }
       },
-      
+
       disconnectWallet: async () => {
-        try {
-          set({ loading: true, error: null });
-          if (activeEthereumProvider) {
-            safeOff(activeEthereumProvider, 'accountsChanged', accountsChangedHandler);
-            safeOff(activeEthereumProvider, 'chainChanged', chainChangedHandler);
-          }
-          accountsChangedHandler = null;
-          chainChangedHandler = null;
-          activeEthereumProvider = null;
-          set({
-            isAuthenticated: false,
-            user: null,
-            loading: false,
-            error: null,
-          });
-          localStorage.removeItem('auth-storage');
-          sessionStorage.clear();
-          window.location.href = '/';
-        } catch (error) {
-          set({
-            error: (error as Error).message,
-            loading: false,
-          });
+        const provider = activeProvider ?? getInjectedProvider();
+        signOutLocally();
+        // dApps can't force MetaMask to forget a site, but wallets that support
+        // wallet_revokePermissions (MetaMask 11.x+) will drop the grant so the next
+        // Sign In shows the account picker again. Best effort only.
+        if (provider) {
+          requestWallet(provider, 'wallet_revokePermissions', [{ eth_accounts: {} }], 5000).catch(
+            () => undefined
+          );
         }
       },
+
+      restoreWalletSession: async () => {
+        const { isAuthenticated, user } = get();
+        if (!isAuthenticated || !user?.wallet?.address) {
+          return;
+        }
+        const provider = getInjectedProvider();
+        if (!provider) {
+          signOutLocally();
+          return;
+        }
+        try {
+          // eth_accounts never prompts: it only reports accounts this site may already see.
+          const accounts = await requestWallet<string[]>(provider, 'eth_accounts', undefined, 10000);
+          if (!accounts?.length) {
+            signOutLocally();
+            toast.info('Your wallet session ended. Sign in again to continue.');
+            return;
+          }
+          attachProvider(provider);
+          const address = ethers.utils.getAddress(accounts[0]);
+          if (address !== user.wallet.address) {
+            await onAccountsChanged(accounts);
+            return;
+          }
+          const chainId = await readChainId(provider);
+          const balance = await readBalance(provider, address);
+          set((state) => ({
+            user: state.user?.wallet
+              ? { ...state.user, wallet: { ...state.user.wallet, chainId, balance, isConnected: true } }
+              : state.user,
+          }));
+        } catch {
+          // Extension not responding: keep the session; events will resync it when it wakes up.
+        }
+      },
+
+      clearWalletError: () => set({ walletError: null }),
 
       submitKYC: async (documents: KYCData['documents']) => {
         try {

@@ -1,10 +1,12 @@
 import { useState, useEffect, type MouseEvent } from 'react';
 import { Link, useLocation, useNavigate } from 'react-router-dom';
-import { Menu, X, LogOut, ExternalLink } from 'lucide-react';
+import { Menu, X, LogOut, ExternalLink, Loader2 } from 'lucide-react';
 import { Button } from '../ui/Button';
 import { motion, AnimatePresence } from 'framer-motion';
 import { AnimatedLogo } from '../AnimatedLogo';
 import { useAuthStore } from '@/store/authStore';
+import { useWalletStatus } from '@/hooks/useWalletStatus';
+import { WalletStatusChip } from './WalletStatusChip';
 
 // Assuming AnimatedLogoProps is defined elsewhere and includes className
 interface AnimatedLogoProps {
@@ -18,6 +20,7 @@ export const Header = () => {
   const location = useLocation();
   const navigate = useNavigate();
   const { isAuthenticated, logout, openAuthModal } = useAuthStore();
+  const { status: walletStatus, address } = useWalletStatus();
 
   useEffect(() => {
     const handleScroll = () => {
@@ -59,13 +62,8 @@ export const Header = () => {
   const renderAuthButton = () => {
     if (isAuthenticated) {
       return (
-        <div className="flex items-center gap-4">
-          <Link
-            to="/dashboard"
-            className="text-sm text-neutral-600 hover:text-blue-600"
-          >
-            Dashboard
-          </Link>
+        <div className="flex flex-col md:flex-row items-center justify-center gap-3 md:gap-4">
+          <WalletStatusChip />
           <Button
             variant="outline"
             onClick={handleLogout}
@@ -73,13 +71,23 @@ export const Header = () => {
             className="flex items-center gap-2"
           >
             <LogOut size={16} />
-            {isLoggingOut ? 'Logging out...' : 'Logout'}
+            {isLoggingOut ? 'Disconnecting...' : address ? 'Disconnect' : 'Logout'}
           </Button>
         </div>
       );
     }
 
-    return <Button onClick={handleOpenAuthModal}>Sign In</Button>;
+    // The modal can be closed while MetaMask is still open; reflect that here so a
+    // second click reopens the progress view instead of looking like nothing happened.
+    const busy = walletStatus === 'connecting' || walletStatus === 'switching';
+    return (
+      <Button
+        onClick={handleOpenAuthModal}
+        icon={busy ? <Loader2 size={16} className="animate-spin" /> : undefined}
+      >
+        {busy ? 'Connecting…' : 'Sign In'}
+      </Button>
+    );
   };
 
   const navItems = [

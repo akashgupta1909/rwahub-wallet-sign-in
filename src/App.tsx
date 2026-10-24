@@ -97,6 +97,21 @@ function RedirectAfterAuth() {
   return null;
 }
 
+/** Re-validate a persisted wallet session against the wallet itself (no prompt). */
+function WalletSessionSync() {
+  const restoreWalletSession = useAuthStore((state) => state.restoreWalletSession);
+
+  useEffect(() => {
+    if (useAuthStore.persist.hasHydrated()) {
+      restoreWalletSession();
+      return;
+    }
+    return useAuthStore.persist.onFinishHydration(() => restoreWalletSession());
+  }, [restoreWalletSession]);
+
+  return null;
+}
+
 function BootstrapApiData() {
   const fetchAssets = useMockDataStore((state) => state.fetchAssets);
   const fetchValidators = useValidatorStore((state) => state.fetchValidators);
@@ -115,6 +130,7 @@ function App() {
   return (
     <Router>
       <BootstrapApiData />
+      <WalletSessionSync />
       <RedirectAfterAuth />
       <GlobalAuthModal />
       <Toaster position="top-right" />

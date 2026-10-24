@@ -35,8 +35,10 @@ export const Sidebar: React.FC<SidebarProps> = ({ isCollapsed, toggleSidebar }) 
   const handleLogout = async () => {
     try {
       setLogoutError(null);
+      // Leave the protected route in the same update as signing out, so RequireAuth
+      // doesn't treat a deliberate disconnect as "session expired" and pop Sign In.
+      navigate('/', { replace: true });
       await logout();
-      navigate('/');
     } catch (err) {
       console.error('Logout failed:', err);
       setLogoutError(error || 'Failed to log out. Please try again.');
@@ -157,12 +159,12 @@ export const Sidebar: React.FC<SidebarProps> = ({ isCollapsed, toggleSidebar }) 
             <LogOut size={22} className="shrink-0" />
             {!isCollapsed && (
               <span className="text-sm font-medium">
-                {loading ? 'Logging out...' : 'Logout'}
+                {loading ? 'Disconnecting...' : 'Disconnect'}
               </span>
             )}
             {isCollapsed && (
               <div className="absolute left-full ml-2 px-2 py-1 bg-gray-800 text-white text-xs rounded-md opacity-0 group-hover:opacity-100 transition-opacity duration-200 pointer-events-none">
-                {loading ? 'Logging out...' : 'Logout'}
+                {loading ? 'Disconnecting...' : 'Disconnect'}
               </div>
             )}
           </motion.button>

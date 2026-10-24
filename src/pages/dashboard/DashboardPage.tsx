@@ -1,12 +1,14 @@
 import React, { useEffect, useMemo, useState } from 'react';
 import { motion } from 'framer-motion';
-import { Package, DollarSign, Clock, AlertCircle, Search, Filter } from 'lucide-react';
+import { Package, DollarSign, Clock, AlertCircle, AlertTriangle, Search, Filter } from 'lucide-react';
 import { Button } from '@/components/ui/Button';
 import { useMockDataStore } from '@/store/mockDataStore';
 import { formatCurrency } from '@/utils/format';
 import { useAuthStore } from '@/store/authStore';
 import { isOnChainConfigured } from '@/utils/onchain';
 import { dashboardApi, DashboardStats } from '@/api/dashboard';
+import { useWalletStatus } from '@/hooks/useWalletStatus';
+import { shortenAddress } from '@/lib/wallet';
 
 function statusLabel(status?: string) {
   if (!status) {
@@ -49,15 +51,11 @@ export default function DashboardPage() {
       .catch(() => setDashboardStats(null));
   }, [searchQuery, filterType]);
   const user = useAuthStore((state) => state.user);
-  const switchToPharos = useAuthStore((state) => state.switchToPharos);
-  const wallet = user?.wallet;
-  const onPharos = wallet?.chainId === 50002;
-  const onHardhat = wallet?.chainId === 31337;
-  const chainReady = onPharos || onHardhat;
+  const switchNetwork = useAuthStore((state) => state.switchNetwork);
+  const { status: walletStatus, address, chainName, targetChainName, error: walletError } = useWalletStatus();
+  const wrongNetwork = walletStatus === 'wrong_network' || walletStatus === 'switching';
   const onChainLive = isOnChainConfigured();
-  const walletLabel = wallet?.address
-    ? `${wallet.address.slice(0, 6)}...${wallet.address.slice(-4)}`
-    : 'Not connected';
+  const walletLabel = address ? shortenAddress(address) : 'Not connected';
 
   const filteredAssets = useMemo(() => {
     try {
@@ -135,24 +133,41 @@ export default function DashboardPage() {
         </div>
         <div className="text-right">
           <p className="text-sm text-gray-500">Wallet</p>
-          <p className="font-medium text-gray-900">{walletLabel}</p>
-          <p className={`text-xs mt-1 ${chainReady ? 'text-green-600' : 'text-amber-600'}`}>
-            {onHardhat ? 'Hardhat Local' : onPharos ? 'Pharos Devnet' : wallet?.chainId ? `Chain ${wallet.chainId}` : 'Network unknown'}
+          <p className="font-medium font-mono text-gray-900" title={address}>{walletLabel}</p>
+          <p className={`text-xs mt-1 ${wrongNetwork ? 'text-amber-600' : 'text-green-600'}`}>
+            {chainName}
           </p>
           <p className="text-xs text-gray-500 mt-1">
             {onChainLive ? 'On-chain contracts configured' : 'Local demo only'}
           </p>
-          {!chainReady && wallet?.isConnected ? (
-            <Button
-              variant="outline"
-              className="mt-2"
-              onClick={() => switchToPharos()}
-            >
-              Switch network
-            </Button>
-          ) : null}
         </div>
       </div>
+
+      {wrongNetwork && (
+        <div
+          role="alert"
+          className="mb-6 flex flex-col sm:flex-row sm:items-center justify-between gap-3 rounded-lg border border-amber-200 bg-amber-50 p-4 text-sm text-amber-800"
+        >
+          <div className="flex items-start gap-3">
+            <AlertTriangle className="w-5 h-5 shrink-0" aria-hidden="true" />
+            <div>
+              <p className="font-semibold">Wrong network</p>
+              <p className="mt-0.5">
+                Your wallet is on {chainName}. Switch to {targetChainName} to tokenize or trade assets.
+              </p>
+              {walletError && <p className="mt-1">{walletError.message}</p>}
+            </div>
+          </div>
+          <Button
+            variant="outline"
+            className="shrink-0 border-amber-300 bg-white"
+            onClick={switchNetwork}
+            disabled={walletStatus === 'switching'}
+          >
+            {walletStatus === 'switching' ? 'Check your wallet…' : `Switch to ${targetChainName}`}
+          </Button>
+        </div>
+      )}
 
       <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-4 mb-6">
         {stats.map((stat) => (
