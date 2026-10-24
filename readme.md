@@ -1,5 +1,9 @@
 # RWAHub: Web3 Marketplace for Real-World Asset Tokenization
 
+> **Wallet Sign In task:** demo video → [docs/wallet-sign-in-demo.mp4](docs/wallet-sign-in-demo.mp4).
+> Code changes are in the latest commit (`src/lib/wallet.ts`, `src/hooks/useWalletStatus.ts`,
+> `src/store/authStore.ts`, `src/components/AuthModal.tsx`, `src/components/layout/Header.tsx`).
+
 ## Overview
 RWAHub is a cutting-edge decentralized marketplace designed to bring real-world asset (RWA) tokenization into the Web3 era.
 The platform empowers users to tokenize, fractionally own, and trade high-value assets — such as real estate, luxury watches, and fine jewelry — with ease and transparency.
